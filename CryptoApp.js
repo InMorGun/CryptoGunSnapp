@@ -1,0 +1,582 @@
+"use client";
+
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+
+// ============================================================
+// CRYPTO TRADING DASHBOARD — BINANCE API Edition
+// ============================================================
+
+const SYMBOLS = [
+  { symbol: "BTCUSDT", base: "BTC", name: "Bitcoin" },
+  { symbol: "ETHUSDT", base: "ETH", name: "Ethereum" },
+  { symbol: "BNBUSDT", base: "BNB", name: "BNB" },
+  { symbol: "SOLUSDT", base: "SOL", name: "Solana" },
+  { symbol: "XRPUSDT", base: "XRP", name: "XRP" },
+  { symbol: "ADAUSDT", base: "ADA", name: "Cardano" },
+  { symbol: "DOGEUSDT", base: "DOGE", name: "Dogecoin" },
+  { symbol: "AVAXUSDT", base: "AVAX", name: "Avalanche" },
+  { symbol: "DOTUSDT", base: "DOT", name: "Polkadot" },
+  { symbol: "LINKUSDT", base: "LINK", name: "Chainlink" },
+  { symbol: "TRXUSDT", base: "TRX", name: "TRON" },
+  { symbol: "NEARUSDT", base: "NEAR", name: "NEAR Protocol" },
+  { symbol: "LTCUSDT", base: "LTC", name: "Litecoin" },
+  { symbol: "UNIUSDT", base: "UNI", name: "Uniswap" },
+  { symbol: "APTUSDT", base: "APT", name: "Aptos" },
+  { symbol: "ARBUSDT", base: "ARB", name: "Arbitrum" },
+  { symbol: "OPUSDT", base: "OP", name: "Optimism" },
+  { symbol: "SUIUSDT", base: "SUI", name: "Sui" },
+  { symbol: "SHIBUSDT", base: "SHIB", name: "Shiba Inu" },
+  { symbol: "PEPEUSDT", base: "PEPE", name: "Pepe" },
+];
+
+const FALLBACK = SYMBOLS.map((s) => ({
+  symbol: s.symbol, base: s.base, name: s.name,
+  price: 0, change24h: 0, high24h: 0, low24h: 0,
+  volume: 0, quoteVolume: 0, trades: 0, klines: [], atr: 0,
+}));
+
+// ============================================================
+// BINANCE FETCHER
+// ============================================================
+async function fetchBinanceData() {
+  const BASE = "https://api.binance.com";
+  const symbolList = SYMBOLS.map((s) => s.symbol);
+
+  const tickerUrl = `${BASE}/api/v3/ticker/24hr?symbols=${JSON.stringify(symbolList)}`;
+  const tickerRes = await fetch(tickerUrl);
+  if (!tickerRes.ok) throw new Error(`Ticker error: ${tickerRes.status}`);
+  const tickers = await tickerRes.json();
+  const tickerMap = {};
+  tickers.forEach((t) => { tickerMap[t.symbol] = t; });
+
+  const klinePromises = symbolList.map((sym) =>
+    fetch(`${BASE}/api/v3/klines?symbol=${sym}&interval=1h&limit=168`)
+      .then((r) => (r.ok ? r.json() : []))
+      .catch(() => [])
+  );
+  const allKlines = await Promise.all(klinePromises);
+
+  return SYMBOLS.map((s, i) => {
+    const t = tickerMap[s.symbol] || {};
+    const klines = allKlines[i] || [];
+    const closePrices = klines.map((k) => parseFloat(k[4]));
+
+    let atr = 0;
+    if (klines.length >= 15) {
+      const trs = [];
+      for (let j = klines.length - 14; j < klines.length; j++) {
+        const h = parseFloat(klines[j][2]);
+        const l = parseFloat(klines[j][3]);
+        const pc = parseFloat(klines[j - 1][4]);
+        trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+      }
+      atr = trs.reduce((a, b) => a + b, 0) / trs.length;
+    }
+
+    return {
+      symbol: s.symbol, base: s.base, name: s.name,
+      price: parseFloat(t.lastPrice) || 0,
+      change24h: parseFloat(t.priceChangePercent) || 0,
+      high24h: parseFloat(t.highPrice) || 0,
+      low24h: parseFloat(t.lowPrice) || 0,
+      volume: parseFloat(t.volume) || 0,
+      quoteVolume: parseFloat(t.quoteVolume) || 0,
+      trades: parseInt(t.count) || 0,
+      klines: closePrices,
+      atr,
+    };
+  });
+}
+
+// ============================================================
+// SPARKLINE
+// ============================================================
+function MiniChart({ data, color, width = 120, height = 40 }) {
+  if (!data || data.length < 2)
+    data = Array.from({ length: 20 }, (_, i) => 50 + Math.sin(i * 0.5) * 20 + Math.random() * 10);
+  const sampled = data.length > 30 ? data.filter((_, i) => i % Math.ceil(data.length / 30) === 0) : data;
+  const min = Math.min(...sampled), max = Math.max(...sampled), range = max - min || 1;
+  const points = sampled.map((v, i) => `${(i / (sampled.length - 1)) * width},${height - ((v - min) / range) * (height - 4) - 2}`).join(" ");
+  const uid = `g${color.replace(/[^a-z0-9]/gi, "")}${width}${height}`;
+  return (
+    <svg width={width} height={height} viewBox={`0 0 ${width} ${height}`} style={{ display: "block" }}>
+      <defs>
+        <linearGradient id={uid} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.3" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polygon points={`0,${height} ${points} ${width},${height}`} fill={`url(#${uid})`} />
+      <polyline points={points} fill="none" stroke={color} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// ============================================================
+// FORMAT HELPERS
+// ============================================================
+const fmtUSD = (p) => {
+  if (!p) return "—";
+  if (p >= 1000) return "$" + p.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  if (p >= 1) return "$" + p.toFixed(2);
+  if (p >= 0.001) return "$" + p.toFixed(4);
+  return "$" + p.toFixed(8);
+};
+const fmtNum = (v) => {
+  if (v >= 1000) return v.toFixed(0);
+  if (v >= 1) return v.toFixed(2);
+  if (v >= 0.001) return v.toFixed(4);
+  return v.toFixed(8);
+};
+const fmtVol = (v) => {
+  if (!v) return "—";
+  if (v >= 1e9) return "$" + (v / 1e9).toFixed(2) + "B";
+  if (v >= 1e6) return "$" + (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return "$" + (v / 1e3).toFixed(0) + "K";
+  return "$" + v.toFixed(0);
+};
+const fmtCount = (v) => {
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+  if (v >= 1e3) return (v / 1e3).toFixed(0) + "K";
+  return String(v);
+};
+
+// ============================================================
+// THEME
+// ============================================================
+const T = {
+  bg: "#0a0e17", card: "#111827", cardInner: "#0d1320", cardHover: "#1a2235",
+  border: "#1e293b", accent: "#00e5a0", accentDim: "rgba(0,229,160,0.15)",
+  blue: "#3b82f6", blueDim: "rgba(59,130,246,0.15)",
+  red: "#ef4444", redDim: "rgba(239,68,68,0.15)",
+  yellow: "#fbbf24", yellowDim: "rgba(251,191,36,0.15)",
+  purple: "#a855f7", orange: "#f97316",
+  text: "#e2e8f0", textDim: "#64748b", textMuted: "#475569",
+  font: "'JetBrains Mono', 'Fira Code', 'SF Mono', monospace",
+};
+
+// ============================================================
+// NAV
+// ============================================================
+function Nav({ page, setPage }) {
+  const items = [
+    { key: "home", label: "Home", icon: "⬡" },
+    { key: "dashboard", label: "Dashboard", icon: "◈" },
+    { key: "signal", label: "Signal", icon: "⚡" },
+    { key: "settings", label: "Settings", icon: "⚙" },
+  ];
+  return (
+    <nav style={{ position: "fixed", top: 0, left: 0, right: 0, zIndex: 100, background: "rgba(10,14,23,0.85)", backdropFilter: "blur(20px)", borderBottom: `1px solid ${T.border}`, padding: "0 24px", height: 60, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }} onClick={() => setPage("home")}>
+        <div style={{ width: 32, height: 32, borderRadius: 8, background: `linear-gradient(135deg, ${T.accent}, #00b4d8)`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 700, color: "#0a0e17", fontFamily: T.font }}>₿</div>
+        <span style={{ fontFamily: "'Outfit', sans-serif", fontWeight: 700, fontSize: 18, color: T.text }}>CryptoTerminal</span>
+        <span style={{ fontSize: 9, padding: "2px 8px", borderRadius: 4, background: T.yellowDim, color: T.yellow, fontFamily: T.font, fontWeight: 600 }}>BINANCE</span>
+      </div>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+        {items.map((it) => (
+          <button key={it.key} onClick={() => setPage(it.key)} style={{ background: page === it.key ? T.accentDim : "transparent", color: page === it.key ? T.accent : T.textDim, border: page === it.key ? "1px solid rgba(0,229,160,0.3)" : "1px solid transparent", borderRadius: 8, padding: "8px 14px", fontFamily: "'Outfit', sans-serif", fontSize: 13, fontWeight: 500, cursor: "pointer", transition: "all 0.2s", display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 14 }}>{it.icon}</span>{it.label}
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+// ============================================================
+// HOME
+// ============================================================
+function HomePage({ setPage }) {
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "80px 24px 40px", position: "relative", overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: "10%", left: "50%", transform: "translate(-50%,-50%)", width: 600, height: 600, borderRadius: "50%", background: "radial-gradient(circle, rgba(0,229,160,0.08) 0%, transparent 70%)", pointerEvents: "none" }} />
+      <div style={{ position: "absolute", bottom: "20%", right: "15%", width: 400, height: 400, borderRadius: "50%", background: "radial-gradient(circle, rgba(251,191,36,0.05) 0%, transparent 70%)", pointerEvents: "none" }} />
+      <div style={{ textAlign: "center", maxWidth: 700, position: "relative", zIndex: 1 }}>
+        <div style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "6px 16px", borderRadius: 20, background: T.yellowDim, border: "1px solid rgba(251,191,36,0.2)", color: T.yellow, fontSize: 12, fontFamily: T.font, fontWeight: 500, marginBottom: 24, letterSpacing: "0.05em" }}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1L10 5.5L15 6.2L11.5 9.5L12.3 14.5L8 12.2L3.7 14.5L4.5 9.5L1 6.2L6 5.5L8 1Z" fill="#fbbf24" /></svg>
+          POWERED BY BINANCE API
+        </div>
+        <h1 style={{ fontFamily: "'Outfit', sans-serif", fontSize: "clamp(40px, 6vw, 64px)", fontWeight: 800, color: T.text, lineHeight: 1.1, margin: "0 0 20px", letterSpacing: "-0.03em" }}>
+          Real-Time Data from{" "}
+          <span style={{ background: `linear-gradient(135deg, ${T.yellow}, ${T.orange})`, WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>Binance</span>
+        </h1>
+        <p style={{ fontFamily: "'Outfit', sans-serif", fontSize: 17, color: T.textDim, lineHeight: 1.7, margin: "0 0 40px", maxWidth: 540, marginLeft: "auto", marginRight: "auto" }}>
+          Live prices, 24h stats, 7-day kline charts, and MQL5-inspired trading signals — all from Binance spot market. No API key required.
+        </p>
+        <div style={{ display: "flex", gap: 12, justifyContent: "center", flexWrap: "wrap" }}>
+          <button onClick={() => setPage("dashboard")} style={{ background: `linear-gradient(135deg, ${T.accent}, #00c9a7)`, color: "#0a0e17", border: "none", borderRadius: 12, padding: "14px 36px", fontSize: 15, fontWeight: 700, fontFamily: "'Outfit', sans-serif", cursor: "pointer", boxShadow: "0 0 30px rgba(0,229,160,0.3)" }}>Open Dashboard →</button>
+          <button onClick={() => setPage("signal")} style={{ background: "transparent", color: T.accent, border: "1px solid rgba(0,229,160,0.4)", borderRadius: 12, padding: "14px 36px", fontSize: 15, fontWeight: 700, fontFamily: "'Outfit', sans-serif", cursor: "pointer" }}>⚡ View Signals</button>
+        </div>
+      </div>
+      <div style={{ marginTop: 80, display: "flex", gap: 48, flexWrap: "wrap", justifyContent: "center", position: "relative", zIndex: 1 }}>
+        {[{ label: "Trading Pairs", value: "20" }, { label: "Data Source", value: "Binance" }, { label: "Klines", value: "1H×168" }, { label: "Signal Engine", value: "MQL5" }].map((s) => (
+          <div key={s.label} style={{ textAlign: "center" }}>
+            <div style={{ fontFamily: T.font, fontSize: 26, fontWeight: 700, color: T.accent }}>{s.value}</div>
+            <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 12, color: T.textDim, marginTop: 4 }}>{s.label}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// DASHBOARD
+// ============================================================
+function DashboardPage({ coins, loading, lastUpdate, error }) {
+  const [sortBy, setSortBy] = useState("quoteVolume");
+  const [sortDir, setSortDir] = useState("desc");
+  const [search, setSearch] = useState("");
+  const toggle = (k) => { if (sortBy === k) setSortDir((d) => (d === "asc" ? "desc" : "asc")); else { setSortBy(k); setSortDir("desc"); } };
+  const sorted = [...coins].filter((c) => (c.name + c.base + c.symbol).toLowerCase().includes(search.toLowerCase())).sort((a, b) => (sortDir === "asc" ? (a[sortBy] ?? 0) - (b[sortBy] ?? 0) : (b[sortBy] ?? 0) - (a[sortBy] ?? 0)));
+  const totalVol = coins.reduce((s, c) => s + (c.quoteVolume || 0), 0);
+  const avgChg = coins.length ? coins.reduce((s, c) => s + c.change24h, 0) / coins.length : 0;
+  const totalTrades = coins.reduce((s, c) => s + (c.trades || 0), 0);
+  const SI = ({ f }) => <span style={{ marginLeft: 4, fontSize: 10, opacity: sortBy === f ? 1 : 0.3 }}>{sortBy === f ? (sortDir === "asc" ? "▲" : "▼") : "▼"}</span>;
+
+  return (
+    <div style={{ padding: "80px 24px 40px", maxWidth: 1280, margin: "0 auto" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", flexWrap: "wrap", gap: 16, marginBottom: 24 }}>
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+            <h2 style={{ fontFamily: "'Outfit', sans-serif", fontSize: 28, fontWeight: 700, color: T.text, margin: 0 }}>Market Overview</h2>
+            <span style={{ fontSize: 9, padding: "3px 8px", borderRadius: 4, background: T.yellowDim, color: T.yellow, fontFamily: T.font, fontWeight: 600 }}>BINANCE SPOT</span>
+          </div>
+          <p style={{ fontFamily: T.font, fontSize: 11, color: T.textMuted, margin: 0 }}>
+            {lastUpdate ? `Updated: ${lastUpdate}` : "Loading..."}{error && <span style={{ color: T.yellow, marginLeft: 8 }}>⚠ Cached</span>}{!error && coins[0]?.price > 0 && <span style={{ color: T.accent, marginLeft: 8 }}>● Live</span>}
+          </p>
+        </div>
+        <div style={{ position: "relative" }}>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search pair..." style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 8, padding: "8px 12px 8px 32px", color: T.text, fontFamily: T.font, fontSize: 12, outline: "none", width: 200 }} />
+          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", fontSize: 13, color: T.textDim }}>⌕</span>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 24 }}>
+        {[
+          { l: "24h Volume (USDT)", v: fmtVol(totalVol), c: T.accent },
+          { l: "Avg 24h Change", v: (avgChg >= 0 ? "+" : "") + avgChg.toFixed(2) + "%", c: avgChg >= 0 ? T.accent : T.red },
+          { l: "Total 24h Trades", v: fmtCount(totalTrades), c: "#00b4d8" },
+          { l: "Pairs Tracked", v: String(coins.length), c: T.yellow },
+        ].map((s) => (
+          <div key={s.l} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: "16px 20px" }}>
+            <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 11, color: T.textDim, marginBottom: 6 }}>{s.l}</div>
+            <div style={{ fontFamily: T.font, fontSize: 20, fontWeight: 600, color: s.c }}>{s.v}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "40px 2fr 1.2fr 100px 110px 110px 130px", padding: "12px 20px", borderBottom: `1px solid ${T.border}`, alignItems: "center" }}>
+          {[{ l: "#", f: null, a: "center" }, { l: "Pair", f: "name", a: "left" }, { l: "Price (USDT)", f: "price", a: "right" }, { l: "24h %", f: "change24h", a: "right" }, { l: "24h High", f: "high24h", a: "right" }, { l: "24h Vol", f: "quoteVolume", a: "right" }, { l: "7d Chart", f: null, a: "center" }].map((c, i) => (
+            <div key={i} onClick={() => c.f && toggle(c.f)} style={{ fontFamily: T.font, fontSize: 10, fontWeight: 600, color: T.textMuted, textTransform: "uppercase", letterSpacing: "0.08em", textAlign: c.a, cursor: c.f ? "pointer" : "default", userSelect: "none" }}>
+              {c.l}{c.f && <SI f={c.f} />}
+            </div>
+          ))}
+        </div>
+        {loading && coins[0]?.price === 0 && (
+          <div style={{ padding: 60, textAlign: "center" }}>
+            <div style={{ width: 32, height: 32, border: `2px solid ${T.border}`, borderTopColor: T.accent, borderRadius: "50%", margin: "0 auto 12px", animation: "spin 1s linear infinite" }} />
+            <div style={{ fontFamily: T.font, fontSize: 12, color: T.textDim }}>Connecting to Binance...</div>
+          </div>
+        )}
+        {sorted.map((coin, idx) => {
+          const isUp = coin.change24h >= 0;
+          return (
+            <div key={coin.symbol} style={{ display: "grid", gridTemplateColumns: "40px 2fr 1.2fr 100px 110px 110px 130px", padding: "14px 20px", borderBottom: "1px solid rgba(30,41,59,0.5)", alignItems: "center", transition: "background 0.15s", animation: "fadeIn 0.3s ease" }} onMouseEnter={(e) => (e.currentTarget.style.background = T.cardHover)} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+              <div style={{ fontFamily: T.font, fontSize: 11, color: T.textMuted, textAlign: "center" }}>{idx + 1}</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 30, height: 30, borderRadius: 10, background: `linear-gradient(135deg, ${isUp ? T.accent : T.red}30, ${isUp ? T.accent : T.red}10)`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: T.font, fontSize: 10, fontWeight: 700, color: isUp ? T.accent : T.red, flexShrink: 0 }}>{coin.base.slice(0, 2)}</div>
+                <div>
+                  <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 13, fontWeight: 600, color: T.text }}>{coin.base}<span style={{ color: T.textMuted, fontWeight: 400 }}>/USDT</span></div>
+                  <div style={{ fontFamily: T.font, fontSize: 10, color: T.textMuted }}>{coin.name}</div>
+                </div>
+              </div>
+              <div style={{ fontFamily: T.font, fontSize: 13, fontWeight: 600, color: T.text, textAlign: "right" }}>{fmtUSD(coin.price)}</div>
+              <div style={{ fontFamily: T.font, fontSize: 12, fontWeight: 600, textAlign: "right", color: isUp ? T.accent : T.red, background: isUp ? T.accentDim : T.redDim, padding: "3px 8px", borderRadius: 6, display: "inline-flex", justifyContent: "flex-end", marginLeft: "auto" }}>{isUp ? "+" : ""}{coin.change24h.toFixed(2)}%</div>
+              <div style={{ fontFamily: T.font, fontSize: 11, color: T.textDim, textAlign: "right" }}>{fmtUSD(coin.high24h)}</div>
+              <div style={{ fontFamily: T.font, fontSize: 11, color: T.textDim, textAlign: "right" }}>{fmtVol(coin.quoteVolume)}</div>
+              <div style={{ display: "flex", justifyContent: "center" }}><MiniChart data={coin.klines} color={isUp ? T.accent : T.red} width={100} height={32} /></div>
+            </div>
+          );
+        })}
+        {sorted.length === 0 && !loading && <div style={{ padding: 40, textAlign: "center", fontFamily: T.font, fontSize: 12, color: T.textDim }}>No pairs found</div>}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SIGNAL ENGINE
+// ============================================================
+function generateSignal(coin, riskPct, accountSize) {
+  const price = coin.price || 0;
+  const chg = coin.change24h || 0;
+  const atr = coin.atr > 0 ? coin.atr : price * 0.015;
+  const dir = chg > 0.5 ? "LONG" : chg < -0.5 ? "SHORT" : "NEUTRAL";
+  const slD = atr * 1.5, tpD = atr * 3.0;
+  const sl = dir === "SHORT" ? price + slD : price - slD;
+  const tp = dir === "SHORT" ? price - tpD : price + tpD;
+  const rr = slD > 0 ? tpD / slD : 0;
+  const riskMoney = accountSize * (riskPct / 100);
+  const posSize = slD > 0 ? riskMoney / slD : 0;
+  const posSizeUSD = posSize * price;
+  const absChg = Math.abs(chg);
+  const strength = absChg > 5 ? "STRONG" : absChg > 2 ? "MODERATE" : "WEAK";
+  const atrPct = price > 0 ? (atr / price) * 100 : 0;
+  const tf = atrPct > 3 ? "4H" : atrPct > 1.5 ? "1H" : "15m";
+  return { direction: dir, entry: price, sl, tp, atr, rr, strength, tf, slDist: slD, tpDist: tpD, posSize, posSizeUSD, atrPct };
+}
+
+// ============================================================
+// SIGNAL CARD
+// ============================================================
+function SignalCard({ coin, signal }) {
+  const price = coin.price;
+  const chg = coin.change24h || 0;
+  const dir = signal.direction;
+  const isBull = dir === "LONG", isBear = dir === "SHORT";
+  const dirColor = isBull ? T.accent : isBear ? T.red : T.yellow;
+  const dirBg = isBull ? T.accentDim : isBear ? T.redDim : T.yellowDim;
+  const [entered, setEntered] = useState(false);
+
+  let progress = 0.5;
+  if (isBull && signal.tp !== signal.sl) progress = (price - signal.sl) / (signal.tp - signal.sl);
+  else if (isBear && signal.sl !== signal.tp) progress = (signal.sl - price) / (signal.sl - signal.tp);
+  progress = Math.max(0, Math.min(1, progress));
+
+  return (
+    <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 20, overflow: "hidden", position: "relative", transition: "transform 0.2s, box-shadow 0.2s" }}
+      onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 32px rgba(0,0,0,0.4)"; }}
+      onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = ""; }}>
+      <div style={{ position: "absolute", top: 0, left: 0, bottom: 0, width: 4, background: dirColor }} />
+
+      {/* Header */}
+      <div style={{ padding: "16px 18px 10px 22px", display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 32, height: 32, borderRadius: 10, background: `linear-gradient(135deg, ${dirColor}40, ${dirColor}15)`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: T.font, fontSize: 11, fontWeight: 700, color: dirColor }}>{coin.base.slice(0, 2)}</div>
+          <div>
+            <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 15, fontWeight: 700, color: T.text }}>{coin.symbol}</div>
+            <div style={{ fontFamily: T.font, fontSize: 9, color: T.textMuted, display: "flex", alignItems: "center", gap: 5 }}>
+              <span style={{ width: 5, height: 5, borderRadius: "50%", background: "#22c55e", display: "inline-block" }} /> BINANCE
+            </div>
+          </div>
+        </div>
+        <div style={{ padding: "4px 12px", borderRadius: 6, background: dirBg, color: dirColor, fontFamily: T.font, fontSize: 11, fontWeight: 700, border: `1px solid ${dirColor}40` }}>
+          {dir === "LONG" ? "BUY" : dir === "SHORT" ? "SELL" : "WAIT"}
+        </div>
+      </div>
+
+      <div style={{ padding: "0 18px 6px 22px", display: "flex", gap: 6 }}>
+        <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 9, fontFamily: T.font, fontWeight: 600, background: signal.strength === "STRONG" ? T.accentDim : signal.strength === "MODERATE" ? T.yellowDim : T.redDim, color: signal.strength === "STRONG" ? T.accent : signal.strength === "MODERATE" ? T.yellow : T.red }}>◉ {signal.strength}</span>
+        <span style={{ padding: "2px 8px", borderRadius: 4, fontSize: 9, fontFamily: T.font, fontWeight: 600, background: T.blueDim, color: T.blue }}>On: {signal.tf}</span>
+      </div>
+
+      {/* Price */}
+      <div style={{ padding: "6px 18px 2px 22px" }}>
+        <div style={{ fontFamily: T.font, fontSize: 32, fontWeight: 700, color: T.text, letterSpacing: "-0.02em", lineHeight: 1.1 }}>${fmtNum(price)}</div>
+        <div style={{ fontFamily: T.font, fontSize: 12, fontWeight: 600, color: chg >= 0 ? T.accent : T.red, marginTop: 4 }}>{chg >= 0 ? "▲" : "▼"} {Math.abs(chg).toFixed(2)}% ({signal.tf})</div>
+      </div>
+
+      {/* Progress */}
+      <div style={{ padding: "12px 18px 8px 22px" }}>
+        <div style={{ width: "100%", height: 6, borderRadius: 3, background: "#1a2235", position: "relative", overflow: "hidden" }}>
+          <div style={{ position: "absolute", top: 0, left: 0, height: "100%", width: `${progress * 100}%`, borderRadius: 3, background: `linear-gradient(90deg, ${T.red}, ${T.yellow} 50%, ${T.accent})`, transition: "width 0.5s" }} />
+          <div style={{ position: "absolute", top: -3, left: `calc(${progress * 100}% - 6px)`, width: 12, height: 12, borderRadius: "50%", background: T.text, border: `2px solid ${T.bg}`, boxShadow: "0 0 6px rgba(255,255,255,0.3)", transition: "left 0.5s" }} />
+        </div>
+      </div>
+
+      {/* Limit */}
+      <div style={{ padding: "6px 18px 8px 22px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: T.cardInner, borderRadius: 10, padding: "9px 14px", border: `1px solid ${T.border}` }}>
+          <span style={{ fontFamily: T.font, fontSize: 10, color: T.textMuted }}><span style={{ color: T.accent }}>◎</span> Limit:</span>
+          <span style={{ fontFamily: T.font, fontSize: 14, fontWeight: 600, color: T.accent }}>${fmtNum(signal.entry)}</span>
+        </div>
+      </div>
+
+      {/* SL / TP */}
+      <div style={{ padding: "0 18px 0 22px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div style={{ background: T.cardInner, borderRadius: 12, padding: "12px 14px", border: "1px solid rgba(239,68,68,0.2)", textAlign: "center" }}>
+          <div style={{ fontFamily: T.font, fontSize: 9, color: T.textMuted, marginBottom: 6 }}>SL</div>
+          <div style={{ fontFamily: T.font, fontSize: 18, fontWeight: 700, color: T.red }}>{fmtNum(signal.sl)}</div>
+        </div>
+        <div style={{ background: T.cardInner, borderRadius: 12, padding: "12px 14px", border: "1px solid rgba(0,229,160,0.2)", textAlign: "center" }}>
+          <div style={{ fontFamily: T.font, fontSize: 9, color: T.textMuted, marginBottom: 6 }}>TP</div>
+          <div style={{ fontFamily: T.font, fontSize: 18, fontWeight: 700, color: T.accent }}>{fmtNum(signal.tp)}</div>
+        </div>
+      </div>
+
+      {/* R:R / ATR */}
+      <div style={{ padding: "8px 18px 0 22px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div style={{ background: T.cardInner, borderRadius: 12, padding: "10px 14px", border: `1px solid ${T.border}`, textAlign: "center" }}>
+          <div style={{ fontFamily: T.font, fontSize: 9, color: T.textMuted, marginBottom: 4 }}>R:R</div>
+          <div style={{ fontFamily: T.font, fontSize: 16, fontWeight: 700, color: T.yellow }}>{signal.rr.toFixed(1)}</div>
+        </div>
+        <div style={{ background: T.cardInner, borderRadius: 12, padding: "10px 14px", border: `1px solid ${T.border}`, textAlign: "center" }}>
+          <div style={{ fontFamily: T.font, fontSize: 9, color: T.textMuted, marginBottom: 4 }}>ATR (1H)</div>
+          <div style={{ fontFamily: T.font, fontSize: 14, fontWeight: 700, color: T.purple }}>{fmtNum(signal.atr)}</div>
+        </div>
+      </div>
+
+      <div style={{ padding: "10px 18px 6px 22px", display: "flex", justifyContent: "space-between" }}>
+        <div style={{ fontFamily: T.font, fontSize: 11, color: T.textDim }}>R:R {signal.rr.toFixed(1)}</div>
+        <div style={{ fontFamily: T.font, fontSize: 11, color: T.textDim }}>x{signal.posSize >= 1 ? signal.posSize.toFixed(2) : signal.posSize.toFixed(4)} Lots</div>
+      </div>
+
+      <div style={{ padding: "0 18px 10px 22px" }}>
+        <div style={{ background: T.cardInner, borderRadius: 10, padding: "9px 14px", border: `1px solid ${T.border}`, textAlign: "center" }}>
+          <span style={{ fontFamily: T.font, fontSize: 10, color: T.textMuted }}>Size: </span>
+          <span style={{ fontFamily: T.font, fontSize: 14, fontWeight: 600, color: T.text }}>${signal.posSizeUSD.toLocaleString("en-US", { maximumFractionDigits: 2 })}</span>
+        </div>
+      </div>
+
+      <div style={{ padding: "0 18px 16px 22px" }}>
+        <button onClick={() => { setEntered(true); setTimeout(() => setEntered(false), 2000); }}
+          style={{ width: "100%", padding: "14px 0", background: entered ? `linear-gradient(135deg, ${T.accent}, #00c9a7)` : `linear-gradient(135deg, ${T.blue}, #2563eb)`, color: entered ? "#0a0e17" : "#fff", border: "none", borderRadius: 12, fontFamily: "'Outfit', sans-serif", fontSize: 14, fontWeight: 700, cursor: "pointer", transition: "all 0.3s", boxShadow: entered ? "0 0 20px rgba(0,229,160,0.4)" : "0 4px 20px rgba(59,130,246,0.3)", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          {entered ? "✓ SIGNAL NOTED" : "⚡ ENTER TRADE"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SIGNAL PAGE
+// ============================================================
+function SignalPage({ coins, settings }) {
+  const riskPct = parseFloat(settings.riskPercent) || 2;
+  const accountSize = parseFloat(settings.accountSize) || 10000;
+  const [filter, setFilter] = useState("ALL");
+
+  const signals = useMemo(() => coins.filter((c) => c.price > 0).map((coin) => ({ coin, signal: generateSignal(coin, riskPct, accountSize) })), [coins, riskPct, accountSize]);
+  const longs = signals.filter((s) => s.signal.direction === "LONG").length;
+  const shorts = signals.filter((s) => s.signal.direction === "SHORT").length;
+  const strongs = signals.filter((s) => s.signal.strength === "STRONG").length;
+  const filtered = filter === "ALL" ? signals : filter === "LONG" ? signals.filter((s) => s.signal.direction === "LONG") : filter === "SHORT" ? signals.filter((s) => s.signal.direction === "SHORT") : signals.filter((s) => s.signal.strength === "STRONG");
+
+  return (
+    <div style={{ padding: "80px 24px 40px", maxWidth: 1200, margin: "0 auto" }}>
+      <div style={{ marginBottom: 24 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 4 }}>
+          <h2 style={{ fontFamily: "'Outfit', sans-serif", fontSize: 28, fontWeight: 700, color: T.text, margin: 0 }}>⚡ Trading Signals</h2>
+          <span style={{ fontSize: 9, padding: "3px 8px", borderRadius: 4, background: T.yellowDim, color: T.yellow, fontFamily: T.font, fontWeight: 600 }}>BINANCE DATA</span>
+        </div>
+        <p style={{ fontFamily: T.font, fontSize: 11, color: T.textMuted }}>ATR from 1H Klines (14-period) • SL=1.5×ATR, TP=3×ATR • Risk {riskPct}% • Account ${accountSize.toLocaleString()}</p>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 12, marginBottom: 20 }}>
+        {[{ l: "Total", v: signals.length, c: T.text }, { l: "Long", v: longs, c: T.accent }, { l: "Short", v: shorts, c: T.red }, { l: "Strong", v: strongs, c: T.yellow }].map((s) => (
+          <div key={s.l} style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: "12px 16px" }}>
+            <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 10, color: T.textDim }}>{s.l} Signals</div>
+            <div style={{ fontFamily: T.font, fontSize: 22, fontWeight: 700, color: s.c, marginTop: 2 }}>{s.v}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 20, flexWrap: "wrap" }}>
+        {[{ k: "ALL", l: "All", n: signals.length }, { k: "LONG", l: "Long", n: longs }, { k: "SHORT", l: "Short", n: shorts }, { k: "STRONG", l: "Strong Only", n: strongs }].map((f) => (
+          <button key={f.k} onClick={() => setFilter(f.k)} style={{ background: filter === f.k ? T.accentDim : T.card, color: filter === f.k ? T.accent : T.textDim, border: `1px solid ${filter === f.k ? "rgba(0,229,160,0.3)" : T.border}`, borderRadius: 8, padding: "6px 14px", fontFamily: T.font, fontSize: 11, fontWeight: 500, cursor: "pointer" }}>
+            {f.l} ({f.n})
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(310px, 1fr))", gap: 16 }}>
+        {filtered.map(({ coin, signal }) => <SignalCard key={coin.symbol} coin={coin} signal={signal} />)}
+      </div>
+      {filtered.length === 0 && <div style={{ textAlign: "center", padding: 60, fontFamily: T.font, fontSize: 13, color: T.textDim }}>No signals match filter</div>}
+
+      <div style={{ marginTop: 24, padding: 16, borderRadius: 12, background: T.yellowDim, border: "1px solid rgba(251,191,36,0.2)" }}>
+        <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 12, fontWeight: 600, color: T.yellow, marginBottom: 4 }}>⚠ Disclaimer</div>
+        <div style={{ fontFamily: T.font, fontSize: 10, color: T.textDim, lineHeight: 1.6 }}>Signals are algorithmic based on Binance market data. NOT financial advice. DYOR.</div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// SETTINGS
+// ============================================================
+function SettingsPage({ settings, setSettings }) {
+  const Sec = ({ title, children }) => (<div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 24, marginBottom: 16 }}><h3 style={{ fontFamily: "'Outfit', sans-serif", fontSize: 16, fontWeight: 600, color: T.text, margin: "0 0 16px" }}>{title}</h3>{children}</div>);
+  const Row = ({ label, desc, children }) => (<div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 0", borderBottom: `1px solid ${T.border}` }}><div><div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 13, fontWeight: 500, color: T.text }}>{label}</div>{desc && <div style={{ fontFamily: T.font, fontSize: 11, color: T.textMuted, marginTop: 2 }}>{desc}</div>}</div>{children}</div>);
+  const Sel = ({ value, onChange, options }) => (<select value={value} onChange={(e) => onChange(e.target.value)} style={{ background: T.bg, border: `1px solid ${T.border}`, borderRadius: 8, padding: "6px 12px", color: T.text, fontFamily: T.font, fontSize: 12, outline: "none", cursor: "pointer" }}>{options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>);
+  const Tog = ({ checked, onChange }) => (<div onClick={() => onChange(!checked)} style={{ width: 44, height: 24, borderRadius: 12, cursor: "pointer", background: checked ? T.accent : T.border, position: "relative", transition: "background 0.2s" }}><div style={{ width: 18, height: 18, borderRadius: "50%", background: "#fff", position: "absolute", top: 3, left: checked ? 23 : 3, transition: "left 0.2s" }} /></div>);
+
+  return (
+    <div style={{ padding: "80px 24px 40px", maxWidth: 640, margin: "0 auto" }}>
+      <h2 style={{ fontFamily: "'Outfit', sans-serif", fontSize: 28, fontWeight: 700, color: T.text, margin: "0 0 8px" }}>Settings</h2>
+      <p style={{ fontFamily: T.font, fontSize: 11, color: T.textMuted, margin: "0 0 24px" }}>Configure dashboard & signal preferences</p>
+
+      <Sec title="Data Source">
+        <Row label="Exchange" desc="Binance Spot API (public, no key needed)"><span style={{ fontFamily: T.font, fontSize: 12, color: T.yellow, fontWeight: 600 }}>Binance</span></Row>
+        <Row label="Auto Refresh"><Tog checked={settings.autoRefresh} onChange={(v) => setSettings((s) => ({ ...s, autoRefresh: v }))} /></Row>
+        <Row label="Refresh Interval"><Sel value={settings.refreshInterval} onChange={(v) => setSettings((s) => ({ ...s, refreshInterval: parseInt(v) }))} options={[{ value: "15", label: "15s" }, { value: "30", label: "30s" }, { value: "60", label: "1m" }, { value: "120", label: "2m" }]} /></Row>
+      </Sec>
+
+      <Sec title="Signal Engine (MQL5)">
+        <Row label="Risk Per Trade" desc="% of account risked per signal"><Sel value={settings.riskPercent} onChange={(v) => setSettings((s) => ({ ...s, riskPercent: v }))} options={[{ value: "1", label: "1% Conservative" }, { value: "2", label: "2% Moderate" }, { value: "5", label: "5% Aggressive" }]} /></Row>
+        <Row label="Account Size" desc="Virtual balance for sizing"><Sel value={settings.accountSize} onChange={(v) => setSettings((s) => ({ ...s, accountSize: v }))} options={[{ value: "1000", label: "$1,000" }, { value: "5000", label: "$5,000" }, { value: "10000", label: "$10,000" }, { value: "50000", label: "$50,000" }]} /></Row>
+      </Sec>
+
+      <Sec title="Notifications">
+        <Row label="Price Alerts"><Tog checked={settings.priceAlerts} onChange={(v) => setSettings((s) => ({ ...s, priceAlerts: v }))} /></Row>
+        <Row label="Alert Threshold"><Sel value={settings.alertThreshold} onChange={(v) => setSettings((s) => ({ ...s, alertThreshold: v }))} options={[{ value: "3", label: "±3%" }, { value: "5", label: "±5%" }, { value: "10", label: "±10%" }]} /></Row>
+      </Sec>
+
+      <div style={{ marginTop: 16, padding: 16, borderRadius: 12, background: T.accentDim, border: "1px solid rgba(0,229,160,0.2)" }}>
+        <div style={{ fontFamily: "'Outfit', sans-serif", fontSize: 12, fontWeight: 600, color: T.accent, marginBottom: 6 }}>◆ Binance API Endpoints</div>
+        <div style={{ fontFamily: T.font, fontSize: 10, color: T.textDim, lineHeight: 1.8 }}>
+          <div>GET /api/v3/ticker/24hr — Price, Volume, 24h Change</div>
+          <div>GET /api/v3/klines — 1H Candles (168 bars = 7 days)</div>
+          <div>ATR = True Range (H/L/C) over 14 periods</div>
+          <div>No API key required — public endpoints only</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+export default function CryptoApp() {
+  const [page, setPage] = useState("home");
+  const [coins, setCoins] = useState(FALLBACK);
+  const [loading, setLoading] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState("");
+  const [error, setError] = useState(false);
+  const [settings, setSettings] = useState({
+    autoRefresh: true, refreshInterval: 30,
+    riskPercent: "2", accountSize: "10000",
+    priceAlerts: false, alertThreshold: "5",
+  });
+  const intRef = useRef(null);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true); setError(false);
+    try {
+      const data = await fetchBinanceData();
+      if (data?.length > 0) { setCoins(data); setLastUpdate(new Date().toLocaleTimeString()); }
+    } catch (err) {
+      console.warn("Binance fetch failed:", err);
+      setError(true); setLastUpdate(new Date().toLocaleTimeString() + " (error)");
+    } finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    if (settings.autoRefresh) intRef.current = setInterval(fetchData, settings.refreshInterval * 1000);
+    return () => { if (intRef.current) clearInterval(intRef.current); };
+  }, [settings.autoRefresh, settings.refreshInterval, fetchData]);
+
+  return (
+    <>
+      <Nav page={page} setPage={setPage} />
+      {page === "home" && <HomePage setPage={setPage} />}
+      {page === "dashboard" && <DashboardPage coins={coins} loading={loading} lastUpdate={lastUpdate} error={error} />}
+      {page === "signal" && <SignalPage coins={coins} settings={settings} />}
+      {page === "settings" && <SettingsPage settings={settings} setSettings={setSettings} />}
+    </>
+  );
+}
